@@ -1,8 +1,10 @@
 import { create } from 'zustand';
-import type { Character, PlayerEnergy, CombatLogEntry, Technique, ActionCost, EffectType } from '../types';
+import type { Character, PlayerEnergy, CombatLogEntry, ActionCost, EffectType, MatchResult } from '../types';
 import { INITIAL_CHARACTERS } from '../data/characters';
+import { selectAction } from './ai';
+import { postMatchSync } from '../services/api';
 
-export type GamePhase = 'login' | 'menu' | 'matchmaking' | 'draft' | 'battle' | 'gameOver';
+export type GamePhase = 'login' | 'menu' | 'matchmaking' | 'draft' | 'battle' | 'gameOver' | 'leaderboard' | 'matchHistory';
 
 export interface BattleCharacter extends Character {
     currentHp: number;
@@ -31,16 +33,24 @@ interface GameState {
     opponentActiveIndex: number;
     playerEnergy: PlayerEnergy;
     opponentEnergy: PlayerEnergy;
+    aiDifficulty: import('../game/ai').AIDifficulty;
     turnNumber: number;
     isPlayerTurn: boolean;
     combatLogs: CombatLogEntry[];
     winner: 'player' | 'opponent' | null;
+    showLogs: boolean;
+    matchHistory: MatchResult[];
 
     // Actions
     login: (name: string, password?: string) => void;
+    toggleLogs: () => void;
     register: (name: string, password?: string) => void;
     logout: () => void;
     addScore: (points: number) => void;
+    calculateMatchPoints: (result: 'win' | 'loss', survivingCharacters: number, totalCharacters: number, playerHpRemaining: number, playerMaxHp: number, turnCount: number) => number;
+    saveMatchResult: (result: 'win' | 'loss') => void;
+    setAIDifficulty: (diff: import('../game/ai').AIDifficulty) => void;
+    migrateLocalMatches: (username?: string) => Promise<void>;
     setPhase: (phase: GamePhase) => void;
     startMatchmaking: () => void;
     tickMatchmaking: () => void;
@@ -51,6 +61,7 @@ interface GameState {
 
     // Battle Actions
     setPlayerActiveIndex: (index: number) => void;
+    setOpponentActiveIndex: (index: number) => void;
     executePlayerAction: (actionType: 'technique' | 'dodge', actionId: string) => void;
     passTurn: () => void;
     executeOpponentTurn: () => void;
@@ -59,9 +70,22 @@ interface GameState {
 
 const initialEnergy: PlayerEnergy = { ki: 0, physical: 0, special: 0 };
 
+// Scoring weights configurable here. Can be later moved to JSON or remote config.
+const MATCH_SCORING_WEIGHTS = {
+    baseWin: 50,
+    perSurvivor: 15,
+    maxHpBonus: 20,
+    maxTurnBonus: 15,
+    lossSurvivor: 5,
+};
+
+// A/B variant can be toggled via localStorage key 'dba_ab_variant' (e.g., 'A' or 'B')
+const AB_VARIANT = localStorage.getItem('dba_ab_variant') || 'A';
+
 const accounts = JSON.parse(localStorage.getItem('dba_accounts') || '{}');
 const currentUser = localStorage.getItem('dba_current_user');
 const savedData = currentUser ? accounts[currentUser] : null;
+const matchHistory = currentUser ? JSON.parse(localStorage.getItem(`dba_matches_${currentUser}`) || '[]') : [];
 
 export const useGameState = create<GameState>((set, get) => ({
     phase: savedData ? 'menu' : 'login',
@@ -81,10 +105,20 @@ export const useGameState = create<GameState>((set, get) => ({
     opponentActiveIndex: 0,
     playerEnergy: { ...initialEnergy },
     opponentEnergy: { ...initialEnergy },
+    aiDifficulty: (localStorage.getItem('dba_ai_difficulty') as any) || 'normal',
     turnNumber: 1,
     isPlayerTurn: true,
     combatLogs: [],
     winner: null,
+    showLogs: false,
+    matchHistory: matchHistory,
+
+    toggleLogs: () => set(s => ({ showLogs: !s.showLogs })),
+
+    setAIDifficulty: (diff) => {
+        localStorage.setItem('dba_ai_difficulty', diff);
+        set({ aiDifficulty: diff });
+    },
 
     login: (name: string, password?: string) => {
         const accs = JSON.parse(localStorage.getItem('dba_accounts') || '{}');
@@ -161,6 +195,113 @@ export const useGameState = create<GameState>((set, get) => ({
         set({ playerScore: newScore, playerRank: newRank });
     },
 
+    calculateMatchPoints: (result: 'win' | 'loss', survivingCharacters: number, _totalCharacters: number, playerHpRemaining: number, playerMaxHp: number, turnCount: number): number => {
+        if (result === 'loss') {
+            // Loss: only consolation points based on survival and turns
+            const survivalBonus = survivingCharacters * 5;
+            const turnBonus = Math.max(0, Math.floor(turnCount / 2));
+            return Math.max(0, survivalBonus + turnBonus);
+        }
+
+        // Win: base + bonuses using configurable weights
+        let weights = { ...MATCH_SCORING_WEIGHTS } as any;
+        if (AB_VARIANT === 'B') {
+            // In variant B, reward survival slightly more and shorten turn bonus
+            weights.perSurvivor = Math.floor(weights.perSurvivor * 1.25);
+            weights.maxTurnBonus = Math.floor(weights.maxTurnBonus * 0.8);
+        }
+
+        let points = weights.baseWin;
+        points += survivingCharacters * weights.perSurvivor;
+
+        const hpPercent = Math.min(1, playerHpRemaining / playerMaxHp);
+        points += Math.floor(hpPercent * weights.maxHpBonus);
+
+        const turnBonus = turnCount <= 10 ? weights.maxTurnBonus : Math.max(0, weights.maxTurnBonus - Math.floor((turnCount - 10) / 2));
+        points += turnBonus;
+
+        return Math.floor(points);
+    },
+
+    saveMatchResult: (result: 'win' | 'loss') => {
+        const s = get();
+        const playerSurviving = s.playerRoster.filter(c => c.currentHp > 0).length;
+        const playerMaxHp = s.playerRoster.reduce((sum, c) => sum + c.maxHp, 0);
+        const playerCurrentHp = s.playerRoster.reduce((sum, c) => sum + c.currentHp, 0);
+
+        const pointsEarned = get().calculateMatchPoints(
+            result,
+            playerSurviving,
+            s.playerRoster.length,
+            playerCurrentHp,
+            playerMaxHp,
+            s.turnNumber
+        );
+
+        const matchResult: MatchResult = {
+            id: `match_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            date: Date.now(),
+            result,
+            pointsEarned,
+            opponentTeam: s.opponentRoster.map(c => c.id),
+            playerTeam: s.playerRoster.map(c => c.id),
+            turns: s.turnNumber,
+            playerHpRemaining: playerCurrentHp
+        };
+
+        // Save to localStorage for current user
+        if (s.playerName) {
+            const allMatches = JSON.parse(localStorage.getItem(`dba_matches_${s.playerName}`) || '[]');
+            allMatches.push(matchResult);
+            localStorage.setItem(`dba_matches_${s.playerName}`, JSON.stringify(allMatches));
+
+            // Update match history in store
+            set(st => ({ matchHistory: [...st.matchHistory, matchResult] }));
+        }
+
+        // Award points to player
+        get().addScore(pointsEarned);
+        // Try to sync to server (best-effort)
+        try {
+            postMatchSync(matchResult).catch(() => {});
+        } catch (e) {
+            // ignore
+        }
+        // Try migration once per user when API configured
+        const apiUrl = localStorage.getItem('dba_api_url');
+        if (apiUrl) {
+            const migratedFlag = `dba_migrated_${s.playerName}`;
+            if (!localStorage.getItem(migratedFlag)) {
+                // best-effort background migration
+                get().migrateLocalMatches(s.playerName).catch(() => {});
+                localStorage.setItem(migratedFlag, '1');
+            }
+        }
+    },
+
+    migrateLocalMatches: async (username?: string) => {
+        const user = username || get().playerName;
+        if (!user) return;
+        const apiUrl = localStorage.getItem('dba_api_url');
+        if (!apiUrl) return;
+        const existing = JSON.parse(localStorage.getItem(`dba_matches_${user}`) || '[]');
+        const synced: string[] = [];
+        for (const m of existing) {
+            try {
+                const res = await postMatchSync(m);
+                if ((res as any).ok) synced.push(m.id);
+            } catch (_) {
+                // ignore individual errors
+            }
+        }
+        // Safe cleanup: only remove matches confirmed by server
+        if (synced.length > 0) {
+            const remaining = existing.filter((m: any) => !synced.includes(m.id));
+            localStorage.setItem(`dba_matches_${user}`, JSON.stringify(remaining));
+            localStorage.setItem(`dba_migrated_last_${user}`, Date.now().toString());
+        }
+    },
+
     setPhase: (phase) => set({ phase }),
 
     startMatchmaking: () => {
@@ -170,6 +311,18 @@ export const useGameState = create<GameState>((set, get) => ({
     tickMatchmaking: () => {
         const { matchmakingTimer } = get();
         if (matchmakingTimer > 0) {
+            // Active search simulation: chance to find a match increases over time
+            const timeElapsed = 30 - matchmakingTimer;
+            const baseChance = 0.04; // base 4% per second
+            const ramp = Math.min(0.25, timeElapsed * 0.02); // ramp up to +25%
+            const foundChance = baseChance + ramp;
+
+            if (Math.random() < foundChance) {
+                // Found an opponent -> proceed to draft
+                get().startDraft();
+                return;
+            }
+
             set({ matchmakingTimer: matchmakingTimer - 1 });
         } else {
             get().startDraft();
@@ -273,6 +426,13 @@ export const useGameState = create<GameState>((set, get) => ({
         }
     },
 
+    setOpponentActiveIndex: (index: number) => {
+        const state = get();
+        if (state.phase === 'battle' && state.opponentRoster[index] && state.opponentRoster[index].currentHp > 0) {
+            set({ opponentActiveIndex: index });
+        }
+    },
+
     executePlayerAction: (actionType, actionId) => {
         const state = get();
         if (!state.isPlayerTurn || state.phase !== 'battle' || state.winner) return;
@@ -282,8 +442,6 @@ export const useGameState = create<GameState>((set, get) => ({
 
         let energyCost: ActionCost = {};
         let actionName = '';
-        let damage = 0;
-        let effect: EffectType = 'none';
         let cooldown = 0;
 
         // Find action
@@ -294,8 +452,6 @@ export const useGameState = create<GameState>((set, get) => ({
 
             energyCost = tech.cost;
             actionName = tech.name;
-            damage = tech.damage;
-            effect = tech.effect;
             cooldown = tech.cooldown;
 
         } else if (actionType === 'dodge') {
@@ -335,22 +491,62 @@ export const useGameState = create<GameState>((set, get) => ({
 
         // Process damage
         if (actionType === 'technique') {
-            // Basic damage calculation (simplistic for MVP)
-            let actualDamage = damage * (activeChar.stats.attack / newOppChar.stats.defense);
-            if (effect === 'pierce') actualDamage = damage; // Ignore defense
-            actualDamage = Math.floor(actualDamage);
+            const tech = activeChar.techniques.find(t => t.id === actionId)!;
 
-            newOppChar.currentHp -= actualDamage;
-            logDetail += ` Deals ${actualDamage} damage!`;
+            // Determine if technique hits ALL opponents (AoE) by name/description heuristics
+            const isAoE = /\bAoE\b|\bALL\b/i.test(tech.name + ' ' + tech.description);
 
-            // Apply effect
-            if (effect === 'weaken' || effect === 'stun') {
-                newOppChar.statusEffects.push({ effect, duration: 1 });
-                logDetail += ` Opponent is ${effect}ed!`;
+            const applyToTarget = (targetIndex: number) => {
+                const target = { ...newOppRoster[targetIndex] };
+                if (target.currentHp <= 0) return 0;
+
+                let actualDamage = tech.damage * (activeChar.stats.attack / Math.max(1, target.stats.defense));
+                if (tech.effect === 'pierce') actualDamage = tech.damage; // Ignore defense
+                actualDamage = Math.floor(actualDamage);
+
+                target.currentHp -= actualDamage;
+
+                // Apply status effects
+                if (tech.effect === 'weaken' || tech.effect === 'stun') {
+                    target.statusEffects = [...target.statusEffects, { effect: tech.effect, duration: 1 }];
+                }
+                if (tech.effect === 'poison') {
+                    // Poison: dot for next 3 turns
+                    target.statusEffects = [...target.statusEffects, { effect: 'poison', duration: 3 }];
+                }
+
+                newOppRoster[targetIndex] = target;
+                return actualDamage;
+            };
+
+            if (isAoE) {
+                let total = 0;
+                newOppRoster.forEach((_, idx) => {
+                    const dmg = applyToTarget(idx);
+                    if (dmg > 0) total += dmg;
+                });
+                logDetail += ` Deals ${total} total damage to all enemies!`;
+            } else {
+                const actualDamage = applyToTarget(state.opponentActiveIndex);
+                logDetail += ` Deals ${actualDamage} damage!`;
             }
         } else {
             logDetail += ` Prepared to dodge!`;
             newPlayerRoster[state.playerActiveIndex].statusEffects.push({ effect: 'buff', duration: 1 }); // Simplish representation of dodge active
+        }
+
+        // Special: Deep Breath (recover 2 random energy immediately)
+        if (actionType === 'technique' && actionId === 'deep_breath') {
+            const typesArr = ['ki', 'physical', 'special'] as const;
+            let added = 0;
+            let totalNow = pe.ki + pe.physical + pe.special;
+            while (added < 2 && totalNow < 10) {
+                const chosen = typesArr[Math.floor(Math.random() * 3)];
+                (pe as any)[chosen]++;
+                added++;
+                totalNow++;
+            }
+            logDetail += ` Recovers ${added} energy instantly.`;
         }
 
         if (newOppChar.currentHp < 0) newOppChar.currentHp = 0;
@@ -379,7 +575,7 @@ export const useGameState = create<GameState>((set, get) => ({
             const nextOppIndex = newOppRoster.findIndex(c => c.currentHp > 0);
             if (nextOppIndex === -1) {
                 set({ winner: 'player', phase: 'gameOver' });
-                get().addScore(50); // Award points for winning
+                get().saveMatchResult('win'); // Calculate points and save match result
                 return;
             } else {
                 set({ opponentActiveIndex: nextOppIndex });
@@ -415,38 +611,30 @@ export const useGameState = create<GameState>((set, get) => ({
     },
 
     executeOpponentTurn: () => {
-        // Very simple Bot AI
         const state = get();
         if (state.winner || state.phase !== 'battle') return;
 
         const botChar = state.opponentRoster[state.opponentActiveIndex];
         let oe = { ...state.opponentEnergy };
-
-        // Find affordable action that is not on cooldown
-        const availableActions = botChar.techniques.filter(t => {
-            const cd = botChar.cooldowns[t.id] || 0;
-            if (cd > 0) return false;
-            if ((t.cost.ki || 0) > oe.ki) return false;
-            if ((t.cost.physical || 0) > oe.physical) return false;
-            if ((t.cost.special || 0) > oe.special) return false;
-            return true;
-        });
-
-        let actionName = 'Passed';
-        let logDetail = `${botChar.name} ended their turn.`;
-
         const newOppRoster = [...state.opponentRoster];
         const newPlayerRoster = [...state.playerRoster];
         let playerChar = { ...newPlayerRoster[state.playerActiveIndex] };
 
-        if (availableActions.length > 0) {
-            // Pick random available action
-            const action = availableActions[Math.floor(Math.random() * availableActions.length)];
+        // Use AI helper to decide action
+        const difficulty = get().aiDifficulty || 'normal';
+        const decision = selectAction(botChar as any, playerChar as any, oe as any, difficulty as any);
 
+        let actionName = 'Passed';
+        let logDetail = `${botChar.name} ended their turn.`;
+
+        if (decision.type === 'technique' && decision.action) {
+            const action = decision.action;
+            // Deduct cost
             if (action.cost.ki) oe.ki -= action.cost.ki;
             if (action.cost.physical) oe.physical -= action.cost.physical;
             if (action.cost.special) oe.special -= action.cost.special;
 
+            // Apply cooldown
             newOppRoster[state.opponentActiveIndex] = {
                 ...botChar,
                 cooldowns: { ...botChar.cooldowns, [action.id]: action.cooldown }
@@ -457,7 +645,6 @@ export const useGameState = create<GameState>((set, get) => ({
             let actualDamage = action.damage * (botChar.stats.attack / playerChar.stats.defense);
             if (action.effect === 'pierce') actualDamage = action.damage;
 
-            // Check if player is dodging
             const playerIsDodging = playerChar.statusEffects.some(e => e.effect === 'buff');
             if (playerIsDodging && Math.random() < playerChar.dodge.successRate) {
                 actualDamage = 0;
@@ -467,8 +654,20 @@ export const useGameState = create<GameState>((set, get) => ({
                 playerChar.currentHp -= actualDamage;
                 logDetail = `${botChar.name} used ${actionName}. Deals ${actualDamage} damage!`;
             }
+
+        } else if (decision.type === 'dodge') {
+            // Prepare dodge: set buff on opponent
+            newOppRoster[state.opponentActiveIndex] = { ...botChar };
+            newOppRoster[state.opponentActiveIndex].statusEffects = [...newOppRoster[state.opponentActiveIndex].statusEffects, { effect: 'buff', duration: 1 }];
+            // Set dodge cooldown
+            newOppRoster[state.opponentActiveIndex].cooldowns = { ...newOppRoster[state.opponentActiveIndex].cooldowns, ['dodge']: 1 };
+            actionName = botChar.dodge.name || 'Dodge';
+            logDetail = `${botChar.name} prepares to dodge.`;
+
         } else {
-            // Just normal pass
+            // pass
+            actionName = 'Passed';
+            logDetail = `${botChar.name} ended their turn.`;
         }
 
         if (playerChar.currentHp < 0) playerChar.currentHp = 0;
@@ -496,6 +695,7 @@ export const useGameState = create<GameState>((set, get) => ({
             const nextPlayerIndex = newPlayerRoster.findIndex(c => c.currentHp > 0);
             if (nextPlayerIndex === -1) {
                 set({ winner: 'opponent', phase: 'gameOver' });
+                get().saveMatchResult('loss'); // Save match result for loss
                 return;
             } else {
                 set({ playerActiveIndex: nextPlayerIndex });
@@ -553,6 +753,68 @@ export const useGameState = create<GameState>((set, get) => ({
                 if (oTotal >= 10) break;
                 oe[types[Math.floor(Math.random() * 3)]]++;
                 oTotal++;
+            }
+
+            // Namekian Passive Recovery: Piccolo recovers +1 random energy per turn
+            const pPiccolo = pRoster.find(c => c.id === 'piccolo' && c.currentHp > 0);
+            const oPiccolo = oRoster.find(c => c.id === 'piccolo' && c.currentHp > 0);
+            
+            if (pPiccolo && pTotal < 10) {
+                pe[types[Math.floor(Math.random() * 3)]]++;
+                pTotal++;
+            }
+            
+            if (oPiccolo && oTotal < 10) {
+                oe[types[Math.floor(Math.random() * 3)]]++;
+                oTotal++;
+            }
+
+            // Apply DOT/status effects (poison, weaken/stun durations) and create logs
+            const logs: CombatLogEntry[] = [];
+
+            const applyStatusTick = (roster: typeof pRoster, isOpponent: boolean) => {
+                roster.forEach(ch => {
+                    if (ch.currentHp <= 0) return;
+
+                    // Process poison
+                    const poisonEffects = ch.statusEffects.filter(e => e.effect === 'poison');
+                    if (poisonEffects.length > 0) {
+                        // Poison damage scales lightly with maxHp
+                        const dot = Math.max(8, Math.floor(ch.maxHp * 0.03));
+                        ch.currentHp -= dot;
+                        logs.push({ id: Date.now() + Math.floor(Math.random() * 1000), turn: s.turnNumber, playerName: isOpponent ? 'Opponent' : 'Player', characterName: ch.name, action: 'Poison Tick', details: `${ch.name} takes ${dot} poison damage.`, isOpponent });
+                    }
+
+                    // Decrease durations and remove expired
+                    ch.statusEffects = ch.statusEffects.map(se => ({ ...se, duration: se.duration - 1 })).filter(se => se.duration > 0);
+                });
+            };
+
+            applyStatusTick(pRoster, false);
+            applyStatusTick(oRoster, true);
+
+            // Merge any generated logs to combat logs (most recent first)
+            if (logs.length) {
+                set(st => ({ combatLogs: [...logs, ...st.combatLogs] }));
+            }
+
+            // Clamp HP floor and check for deaths caused by DOT
+            // (HP clamped and death checks handled below)
+
+            const playerAliveAfter = pRoster.filter(c => c.currentHp > 0).length;
+            const oppAliveAfter = oRoster.filter(c => c.currentHp > 0).length;
+
+            // Check for victory by DOTs
+            if (oppAliveAfter === 0) {
+                set({ playerRoster: pRoster, opponentRoster: oRoster, playerEnergy: pe, opponentEnergy: oe, winner: 'player', phase: 'gameOver' });
+                get().saveMatchResult('win');
+                return;
+            }
+
+            if (playerAliveAfter === 0) {
+                set({ playerRoster: pRoster, opponentRoster: oRoster, playerEnergy: pe, opponentEnergy: oe, winner: 'opponent', phase: 'gameOver' });
+                get().saveMatchResult('loss');
+                return;
             }
 
             set({
