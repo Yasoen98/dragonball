@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="12" fill="#0b1320"/>
+  <defs>
+    <linearGradient id="tg_shining_sword_attack" x1="0" x2="1">
+      <stop offset="0" stop-color="#f97316"/>
+      <stop offset="1" stop-color="#ea580c"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="10" fill="url(#tg_shining_sword_attack)" stroke="#aaa" stroke-width="2"/>
+  <circle cx="64" cy="64" r="40" fill="#fff" opacity="0.1"/>
+  <circle cx="64" cy="64" r="25" fill="#fff" opacity="0.15"/>
+</svg>

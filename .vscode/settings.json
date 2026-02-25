@@ -1,0 +1,24 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^apt-get update && apt-get install -y imagemagick$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --version \\|\\| true$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node projekt/scripts/addTechniqueIcons\\.mjs$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd projekt && npm init -y >/dev/null 2>&1 \\|\\| true && npm install puppeteer --no-audit --silent$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd projekt && node scripts/convertSvgsToPngs\\.mjs$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

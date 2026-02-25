@@ -1,6 +1,6 @@
 export type EnergyType = 'ki' | 'physical' | 'special';
 
-export type EffectType = 'stun' | 'weaken' | 'buff' | 'pierce' | 'none';
+export type EffectType = 'stun' | 'weaken' | 'poison' | 'buff' | 'pierce' | 'none';
 
 export interface ActionCost {
   ki?: number;
@@ -60,4 +60,15 @@ export interface CombatLogEntry {
   action: string;
   details: string;
   isOpponent: boolean;
+}
+
+export interface MatchResult {
+  id: string;
+  date: number;
+  result: 'win' | 'loss';
+  pointsEarned: number;
+  opponentTeam: string[];
+  playerTeam: string[];
+  turns: number;
+  playerHpRemaining: number;
 }
